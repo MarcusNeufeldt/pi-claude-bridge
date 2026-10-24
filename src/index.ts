@@ -31,6 +31,9 @@ import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { forgetSessionCwd, rememberSessionCwd, rememberSummarySession, sessionCwdFor, summarySessionFor } from "./session-cwd.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
 import { rateLimitResponse } from "./rate-limit.js";
+import { CachedSummaries, type SummaryCapture } from "./cached-summary.js";
+
+const cachedSummaries = new CachedSummaries(newAssistantOutput);
 
 // --- Debug logging ---
 // CLAUDE_BRIDGE_DEBUG=1 enables debug logging to the bridge log in pi's agent
@@ -294,6 +297,7 @@ const markRebuildHooks: Set<MarkRebuildHook> =
  *  with no session id, so such a rewrite forces the REBUILD side; the discard
  *  set holds real ids only — see the comment on historyRewrittenBySession. */
 function markRebuildForSession(piSession: string | null, event: string): void {
+	cachedSummaries.invalidate(piSession);
 	// The rewriting session's own mirror: the rewrite changed the history it was
 	// built from, so its next sync must REBUILD rather than REUSE. Every other
 	// session's mirror stays untouched — its conversation was never rewritten.
@@ -867,6 +871,7 @@ export const __test = {
 		queryImpl = fn ?? query;
 	},
 	resetSharedSession(piSessionId?: string | null) {
+		cachedSummaries.invalidate(piSessionId);
 		// No id: full reset (the pre-map semantics — tests start from a blank slate).
 		if (piSessionId === undefined) sharedSessions.clear();
 		else setSessionStateFor(piSessionId, null);
@@ -1489,6 +1494,7 @@ async function consumeQuery(
 	model: Model<any>,
 	wasAborted: () => boolean,
 	queryCtx: QueryContext,
+	forkCapture?: SummaryCapture,
 ): Promise<{ capturedSessionId?: string; failure?: Error }> {
 	let capturedSessionId: string | undefined;
 	let failure: Error | undefined;
@@ -1581,6 +1587,8 @@ async function consumeQuery(
 			}
 			continue;
 		}
+		// The first query has no shared mirror yet, and its Pi stream may already be closed.
+		if (message.type === "system" && message.subtype === "init" && forkCapture) forkCapture.sessionId = message.session_id;
 		if (!queryCtx.currentPiStream || !queryCtx.turnOutput) continue;
 
 		switch (message.type) {
@@ -1795,6 +1803,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// Pi's compaction, branch-summary and bug-report calls use cacheRetention:"none"
 	// in completeSummarization. Their prompts bypass the capture boundaries, so route
 	// them to an isolated persistSession:false CC process without session sync.
+	if (options?.headers?.["x-claude-bridge-fork"] === "1") return cachedSummaries.stream(model, context, options);
 	if (options?.cacheRetention === "none") {
 		debug(`provider: one-off summarizer call (cacheRetention none) routed to isolated summary, msgs=${context.messages.length}`);
 		return isolatedStreamFn(model, context, options);
@@ -2091,6 +2100,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		`ctxFiles=${promptCapture?.contextFiles.length ?? 0} strictMcp=${strictMcpConfigEnabled}`,
 		`prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);
 
+	const forkCapture = cachedSummaries.record(options?.sessionId, model, context, queryOptions, mcpTools, options?.reasoning);
+
 	// 3. Start SDK query and claim it for this context
 	let wasAborted = false;
 	const sdkQuery = queryImpl({ prompt: promptStream.stream, options: queryOptions });
@@ -2109,6 +2120,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const onAbort = () => {
 		if (wasAborted) return;
 		wasAborted = true;
+		if (forkCapture) forkCapture.valid = false;
 		drainForAbort(abortCtx, promptStream);
 		requestAbort();
 	};
@@ -2133,8 +2145,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	queryCtx.bindRunSignal = bindRunSignal;
 
 	// Background consumer — runs until query ends
-	consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx)
+	consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx, forkCapture)
 		.then(async ({ capturedSessionId, failure }) => {
+			if (forkCapture && (wasAborted || failure || abandonedQueries.has(sdkQuery) || syncResult.preserveSharedSession)) forkCapture.valid = false;
 			debug(`provider: consumeQuery completed, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}, aborted=${wasAborted}`);
 			// The same teardown as the SDK's own throw after an error result: the
 			// session mirror is dropped, so a steer never incorporated is rebuilt.
@@ -2199,6 +2212,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			finalizeCurrentStream(queryCtx, queryCtx.turnOutput?.stopReason);
 		})
 		.catch((error) => {
+			if (forkCapture) forkCapture.valid = false;
 			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
 			if (abandonedQueries.has(sdkQuery)) {
 				debug("provider: discarded query ended in error, leaving session and stream to its replacement");
@@ -2490,6 +2504,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Reset shared session on pi session lifecycle events
 	const clearSession = (event: string) => {
+		cachedSummaries.clear();
 		debug(`${event}: clearing ${sharedSessions.size} shared session${sharedSessions.size === 1 ? "" : "s"}`);
 		// Whole map: children never emit session_shutdown (only runtime teardown
 		// and /reload do), so there is no per-entry removal to do here — the
@@ -2577,7 +2592,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("turn_start", (_event, ctx) => {
 		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
 	});
-	pi.on("session_shutdown", (_event, ctx) => {
+	pi.on("session_shutdown", async (_event, ctx) => {
+		await cachedSummaries.shutdown();
 		forgetSessionCwd(ctx.sessionManager.getSessionId());
 		reportLeaks("session_shutdown");
 		clearSession("session_shutdown");

@@ -129,6 +129,8 @@ Hooks do not fire on isolated summary queries.
 
 pi runs compaction and branch summaries natively. The bridge routes their `cacheRetention: "none"` calls to isolated Claude Code queries, leaving the live session untouched until pi completes the history rewrite. Other extensions can provide summaries through pi's hooks.
 
+Compaction extensions can request a cache-preserving summary with `x-claude-bridge-fork: 1`, the Pi session id, and the original conversation followed by one summary instruction. The bridge verifies and copies the native history into a private transcript, keeps the original system prompt and tool definitions, and refuses tool execution in the summary. Missing, stale, mismatched or unsafe contexts return an error so the caller can fall back to normal Pi compaction. Cache reuse and total cost still depend on the model and cache state.
+
 ### System prompt rejections
 
 Other extensions can change the system prompt. When the result still contains pi's built-in system prompt text, or the two documentation paths that Anthropic looks for (`docs/custom-provider.md` in the same prompt with `docs/packages.md`), the bridge stops the turn instead of sending it, since Anthropic may otherwise bill these requests as Extra Usage. Fix the source extension before retrying; `CLAUDE_BRIDGE_DEBUG=1` writes the full prompt to the bridge log when this happens.
